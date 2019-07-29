@@ -126,3 +126,7 @@ func (hook *ElasticSearchHook) Levels() []logrus.Level {
 func (hook *ElasticSearchHook) Cancel() {
 	hook.ctxCancel()
 }
+
+func (hook *ElasticSearchHook) Flush() {
+	hook.processor.Flush()
+}
