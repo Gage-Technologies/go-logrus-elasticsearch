@@ -16,6 +16,15 @@ import (
 	"golang.org/x/net/context"
 )
 
+var levels = []logrus.Level{
+	logrus.PanicLevel,
+	logrus.FatalLevel,
+	logrus.ErrorLevel,
+	logrus.WarnLevel,
+	logrus.InfoLevel,
+	logrus.DebugLevel,
+}
+
 type IndexNameFunc func() string
 
 type ElasticSearchHook struct {
@@ -35,24 +44,20 @@ func NewElasticHook(
 	indexFunc IndexNameFunc,
 	flushInterval time.Duration,
 ) (*ElasticSearchHook, error) {
-
-	levels := []logrus.Level{}
-	for _, l := range []logrus.Level{
-		logrus.PanicLevel,
-		logrus.FatalLevel,
-		logrus.ErrorLevel,
-		logrus.WarnLevel,
-		logrus.InfoLevel,
-		logrus.DebugLevel,
-	} {
-		if l <= level {
-			levels = append(levels, l)
-		}
+	// create new slice to hold levels permitted by the logger
+	loggerLevels := make([]logrus.Level, 0)
+	// load all levels permitted by the logger into the slice
+	for _, l := range levels {
+		if l <= level { loggerLevels = append(loggerLevels, l) }
 	}
 
+	// create context for the hook
 	ctx, cancel := context.WithCancel(context.TODO())
 
+	// attempt to create the data stream
 	res, err := client.Indices.CreateDataStream(indexFunc())
+
+	// handle data stream creation failures excluding errors for existing data streams
 	if err != nil && !strings.Contains(err.Error(), "\"type\":\"resource_already_exists_exception\"") {
 		return nil, fmt.Errorf("failed to create new datastream: %v", err)
 	}
@@ -60,6 +65,7 @@ func NewElasticHook(
 		return nil, fmt.Errorf("failed to create new datastream: %v", res.String())
 	}
 
+	// create a new bul processor
 	processor, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
 		Client:  			client,
 		// flush if buffer crosses 50MB
@@ -74,18 +80,20 @@ func NewElasticHook(
 	})
 	if err != nil { return nil, fmt.Errorf("failed to create bulk indexer: %v", err) }
 
+	// assemble and return hook
 	return &ElasticSearchHook{
 		processor: processor,
 		client:    client,
 		index:     indexFunc,
 		host:      host,
-		levels:    levels,
+		levels:    loggerLevels,
 		ctx:       ctx,
 		ctxCancel: cancel,
 	}, nil
 }
 
 func (hook *ElasticSearchHook) Fire(entry *logrus.Entry) error {
+	// create base map containing necessary information for log
 	data := map[string]interface{}{
 		"Host":       hook.host,
 		"@timestamp": entry.Time.UTC().Format(time.RFC3339Nano),
@@ -93,23 +101,29 @@ func (hook *ElasticSearchHook) Fire(entry *logrus.Entry) error {
 		"Level":      strings.ToUpper(entry.Level.String()),
 	}
 
-	for k, v := range entry.Data {
-		data[k] = v
-	}
+	// add additional fields to log entry map
+	for k, v := range entry.Data { data[k] = v }
 
+	// handle errors added to the log
 	if e, ok := data[logrus.ErrorKey]; ok && e != nil {
 		if err, ok := e.(error); ok {
 			data[logrus.ErrorKey] = err.Error()
 		}
 	}
 
+	// marshall log data into json byte array
 	byteData, err := json.Marshal(data)
 	if err != nil { return fmt.Errorf("failed to marshall json log: %v", err) }
 
+	// add log entry to the bulk processor
 	err = hook.processor.Add(context.TODO(), esutil.BulkIndexerItem{
+		// route the log entry to the index/data-stream relevant at this moment
 		Index: 			hook.index(),
+		// only create documents as we are append-only
 		Action: 		"create",
+		// format log data into reader and store as body
 		Body: 			bytes.NewReader(byteData),
+		// log failures for buffer appends to stderr
 		OnFailure: 		func(ctx context.Context, item esutil.BulkIndexerItem, item2 esutil.BulkIndexerResponseItem, err error) {
 			b, _ := ioutil.ReadAll(item.Body)
 			if b == nil { b = make([]byte, 0) }
