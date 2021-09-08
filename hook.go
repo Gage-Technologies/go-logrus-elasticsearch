@@ -65,7 +65,7 @@ func NewElasticHook(
 		// flush if buffer crosses 50MB
 		FlushBytes:  		1024 * 1024 * 50,
 		// flush if buffer has existed for more than 30 seconds
-		FlushInterval:  	time.Second * 30,
+		FlushInterval:  	flushInterval,
 
 		// handle errors by logging to stderr
 		OnError: 			func(ctx context.Context, err error) {
