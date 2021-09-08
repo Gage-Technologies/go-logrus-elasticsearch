@@ -1,27 +1,26 @@
 package elastic_logrus
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/olivere/elastic/v7"
-	"github.com/pkg/errors"
+	"github.com/elastic/go-elasticsearch/v7"
+	"github.com/elastic/go-elasticsearch/v7/esutil"
 	"golang.org/x/net/context"
-)
-
-var (
-	// Fired if the
-	// index is not created
-	ErrCannotCreateIndex = fmt.Errorf("Cannot create index")
 )
 
 type IndexNameFunc func() string
 
 type ElasticSearchHook struct {
-	processor *elastic.BulkProcessor
+	processor esutil.BulkIndexer
+	client    *elasticsearch.Client
 	host      string
 	index     IndexNameFunc
 	levels    []logrus.Level
@@ -30,7 +29,7 @@ type ElasticSearchHook struct {
 }
 
 func NewElasticHook(
-	client *elastic.Client,
+	client *elasticsearch.Client,
 	host string,
 	level logrus.Level,
 	indexFunc IndexNameFunc,
@@ -53,37 +52,27 @@ func NewElasticHook(
 
 	ctx, cancel := context.WithCancel(context.TODO())
 
-	exists, err := client.IndexExists(indexFunc()).Do(ctx)
-	if err != nil {
-		return nil, err
-	}
+	res, err := client.Indices.CreateDataStream(indexFunc())
+	if err != nil { return nil, fmt.Errorf("failed to create new datastream: %v", err) }
+	if res.IsError() { return nil, fmt.Errorf("failed to create new datastream: %v", res.String()) }
 
-	if !exists {
-		createIndex, err := client.CreateIndex(indexFunc()).Do(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if !createIndex.Acknowledged {
-			return nil, ErrCannotCreateIndex
-		}
-	}
+	processor, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
+		Client:  			client,
+		// flush if buffer crosses 50MB
+		FlushBytes:  		1024 * 1024 * 50,
+		// flush if buffer has existed for more than 30 seconds
+		FlushInterval:  	time.Second * 30,
 
-	// from elastic docs: "If you want the bulk processor to
-	// operate completely asynchronously, set both BulkActions and BulkSize to
-	// -1 and set the FlushInterval to a meaningful flushInterval."
-	processor, err := client.BulkProcessor().
-		Name(host).
-		BulkActions(-1).
-		BulkSize(-1).
-		FlushInterval(flushInterval).
-		Do(ctx)
-
-	if err != nil {
-		return nil, errors.Wrap(err, "Unable to create bulk processor")
-	}
+		// handle errors by logging to stderr
+		OnError: 			func(ctx context.Context, err error) {
+			_, _ = fmt.Fprintf(os.Stderr, "[%v] ERROR: failed to flush elasticsearch log buffer - %v\n", time.Now(), err)
+		},
+	})
+	if err != nil { return nil, fmt.Errorf("failed to create bulk indexer: %v", err) }
 
 	return &ElasticSearchHook{
 		processor: processor,
+		client:    client,
 		index:     indexFunc,
 		host:      host,
 		levels:    levels,
@@ -110,11 +99,20 @@ func (hook *ElasticSearchHook) Fire(entry *logrus.Entry) error {
 		}
 	}
 
-	r := elastic.NewBulkIndexRequest().
-		Index(hook.index()).Type("log").
-		Doc(data)
+	byteData, err := json.Marshal(data)
+	if err != nil { return fmt.Errorf("failed to marshall json log: %v", err) }
 
-	hook.processor.Add(r)
+	err = hook.processor.Add(context.TODO(), esutil.BulkIndexerItem{
+		Index: 			hook.index(),
+		Action: 		"create",
+		Body: 			bytes.NewReader(byteData),
+		OnFailure: 		func(ctx context.Context, item esutil.BulkIndexerItem, item2 esutil.BulkIndexerResponseItem, err error) {
+			b, _ := ioutil.ReadAll(item.Body)
+			if b == nil { b = make([]byte, 0) }
+			_, _ = fmt.Fprintf(os.Stderr, "[%v] ERROR: failed to add elasticsearch log to buffer - %v\n    LOG: %s\n", time.Now(), err, string(b))
+		},
+	})
+	if err != nil { return fmt.Errorf("failed to add json log to buffer: %v", err) }
 
 	return nil
 }
@@ -128,5 +126,17 @@ func (hook *ElasticSearchHook) Cancel() {
 }
 
 func (hook *ElasticSearchHook) Flush() {
-	hook.processor.Flush()
+	hook.processor.Close(context.TODO())
+	hook.processor, _ = esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
+		Client:  			hook.client,
+		// flush if buffer crosses 50MB
+		FlushBytes:  		1024 * 1024 * 50,
+		// flush if buffer has existed for more than 30 seconds
+		FlushInterval:  	time.Second * 30,
+
+		// handle errors by logging to stderr
+		OnError: 			func(ctx context.Context, err error) {
+			_, _ = fmt.Fprintf(os.Stderr, "[%v] ERROR: failed to flush elasticsearch log buffer - %v\n", time.Now(), err)
+		},
+	})
 }
