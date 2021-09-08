@@ -53,8 +53,12 @@ func NewElasticHook(
 	ctx, cancel := context.WithCancel(context.TODO())
 
 	res, err := client.Indices.CreateDataStream(indexFunc())
-	if err != nil { return nil, fmt.Errorf("failed to create new datastream: %v", err) }
-	if res.IsError() { return nil, fmt.Errorf("failed to create new datastream: %v", res.String()) }
+	if err != nil && !strings.Contains(err.Error(), "\"type\":\"resource_already_exists_exception\"") {
+		return nil, fmt.Errorf("failed to create new datastream: %v", err)
+	}
+	if res.IsError() && !strings.Contains(res.String(), "\"type\":\"resource_already_exists_exception\"") {
+		return nil, fmt.Errorf("failed to create new datastream: %v", res.String())
+	}
 
 	processor, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
 		Client:  			client,
